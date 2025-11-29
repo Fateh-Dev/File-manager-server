@@ -247,6 +247,65 @@ public class FileSystemController : ControllerBase
         }
     }
 
+    [HttpPut("file/{fileId}/move")]
+    public async Task<IActionResult> MoveFile(int fileId, [FromBody] MoveFileDto dto)
+    {
+        try
+        {
+            var userId = GetUserId();
+            var file = await _context.Files.FindAsync(fileId);
+            
+            if (file == null) return NotFound();
+            
+            if (file.OwnerId != userId && !await HasPermission(userId, null, fileId, AccessLevel.Edit))
+                return Forbid();
+
+            // Check if target folder exists and user has permission
+            if (dto.TargetFolderId.HasValue)
+            {
+                var targetFolder = await _context.Folders.FindAsync(dto.TargetFolderId.Value);
+                if (targetFolder == null) return NotFound("Target folder not found");
+                
+                if (targetFolder.OwnerId != userId && !await HasPermission(userId, dto.TargetFolderId.Value, null, AccessLevel.Edit))
+                    return Forbid("No permission to move file here");
+            }
+
+            file.FolderId = dto.TargetFolderId ?? 0; // 0 or null depending on how root is handled, assuming 0/null for root? 
+            // Actually FolderId is int, not int?. If root is not supported for files, we need to check.
+            // Based on models, FolderId is int. Let's assume root is not allowed or handled elsewhere.
+            // Wait, FileMetadata has FolderId as int. If it's nullable in DB, it should be int?.
+            // Let's check FileMetadata model.
+            
+            // Re-reading FileMetadata model...
+            // It was: public int FolderId { get; set; }
+            // So files MUST be in a folder? Or is there a root folder with ID 1?
+            // In App.ts: currentFolderId: number = 1;
+            // So root is 1.
+            
+            if (dto.TargetFolderId.HasValue)
+            {
+                 file.FolderId = dto.TargetFolderId.Value;
+            }
+            else
+            {
+                // If moving to root (if supported via null), set to 1?
+                // The DTO has int? TargetFolderId.
+                // If null, maybe it means root?
+                // Let's assume 1 is root for now as per frontend.
+                 file.FolderId = 1; 
+            }
+
+            await _context.SaveChangesAsync();
+
+            return Ok(new { id = file.Id, name = file.Name, folderId = file.FolderId });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"MoveFile Error: {ex}");
+            return StatusCode(500, new { Error = ex.Message, StackTrace = ex.StackTrace });
+        }
+    }
+
     [HttpGet("search")]
     public async Task<IActionResult> Search([FromQuery] string query)
     {
@@ -267,7 +326,7 @@ public class FileSystemController : ControllerBase
         {
             if (folder.OwnerId == userId || await HasPermission(userId, folder.Id, null, AccessLevel.Read))
             {
-                accessibleFolders.Add(new { id = folder.Id, name = folder.Name });
+                accessibleFolders.Add(new { id = folder.Id, name = folder.Name, parentFolderId = folder.ParentFolderId });
             }
         }
 
@@ -282,7 +341,7 @@ public class FileSystemController : ControllerBase
         {
             if (file.OwnerId == userId || await HasPermission(userId, null, file.Id, AccessLevel.Read))
             {
-                accessibleFiles.Add(new { id = file.Id, name = file.Name, extension = file.Extension, size = file.Size, uploadDate = file.UploadDate });
+                accessibleFiles.Add(new { id = file.Id, name = file.Name, extension = file.Extension, size = file.Size, uploadDate = file.UploadDate, folderId = file.FolderId });
             }
         }
 
@@ -341,6 +400,11 @@ public class RenameFolderDto
 }
 
 public class MoveFolderDto
+{
+    public int? TargetFolderId { get; set; }
+}
+
+public class MoveFileDto
 {
     public int? TargetFolderId { get; set; }
 }
