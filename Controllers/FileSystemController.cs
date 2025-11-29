@@ -113,7 +113,15 @@ public class FileSystemController : ControllerBase
         _context.Files.Add(metadata);
         await _context.SaveChangesAsync();
 
-        return Ok(metadata);
+        return Ok(new 
+        { 
+            id = metadata.Id, 
+            name = metadata.Name, 
+            extension = metadata.Extension, 
+            size = metadata.Size, 
+            uploadDate = metadata.UploadDate,
+            folderId = metadata.FolderId
+        });
     }
 
     [HttpGet("download/{fileId}")]
@@ -426,6 +434,161 @@ public class FileSystemController : ControllerBase
             Console.WriteLine($"HasPermission error: {ex.Message}");
             throw;
         }
+    }
+
+    [HttpGet("recycle-bin")]
+    public async Task<IActionResult> GetRecycleBin()
+    {
+        var userId = GetUserId();
+        
+        var deletedFolders = await _context.Folders
+            .Where(f => f.OwnerId == userId && f.IsDeleted)
+            .Select(f => new { f.Id, f.Name, f.DeletedAt, Type = "folder" })
+            .ToListAsync();
+
+        var deletedFiles = await _context.Files
+            .Where(f => f.OwnerId == userId && f.IsDeleted)
+            .Select(f => new { f.Id, f.Name, f.Size, f.Extension, f.DeletedAt, Type = "file" })
+            .ToListAsync();
+
+        return Ok(new { Folders = deletedFolders, Files = deletedFiles });
+    }
+
+    [HttpPut("folder/{id}/restore")]
+    public async Task<IActionResult> RestoreFolder(int id)
+    {
+        var userId = GetUserId();
+        var folder = await _context.Folders.Include(f => f.SubFolders).Include(f => f.Files).FirstOrDefaultAsync(f => f.Id == id);
+        
+        if (folder == null) return NotFound();
+        if (folder.OwnerId != userId) return Forbid();
+
+        await RestoreFolderRecursive(folder);
+        await _context.SaveChangesAsync();
+
+        return Ok(new { Message = "Folder restored successfully" });
+    }
+
+    private async Task RestoreFolderRecursive(Folder folder)
+    {
+        folder.IsDeleted = false;
+        folder.DeletedAt = null;
+
+        if (folder.SubFolders != null)
+        {
+            foreach (var subFolder in folder.SubFolders)
+            {
+                await RestoreFolderRecursive(subFolder);
+            }
+        }
+
+        if (folder.Files != null)
+        {
+            foreach (var file in folder.Files)
+            {
+                file.IsDeleted = false;
+                file.DeletedAt = null;
+            }
+        }
+    }
+
+    [HttpPut("file/{id}/restore")]
+    public async Task<IActionResult> RestoreFile(int id)
+    {
+        var userId = GetUserId();
+        var file = await _context.Files.FindAsync(id);
+        
+        if (file == null) return NotFound();
+        if (file.OwnerId != userId) return Forbid();
+
+        file.IsDeleted = false;
+        file.DeletedAt = null;
+        await _context.SaveChangesAsync();
+
+        return Ok(new { Message = "File restored successfully" });
+    }
+
+    [HttpDelete("folder/{id}/purge")]
+    public async Task<IActionResult> PurgeFolder(int id)
+    {
+        var userId = GetUserId();
+        var folder = await _context.Folders.Include(f => f.SubFolders).Include(f => f.Files).FirstOrDefaultAsync(f => f.Id == id);
+        
+        if (folder == null) return NotFound();
+        if (folder.OwnerId != userId) return Forbid();
+
+        // Hard delete
+        _context.Folders.Remove(folder);
+        await _context.SaveChangesAsync();
+
+        return Ok(new { Message = "Folder permanently deleted" });
+    }
+
+    [HttpDelete("file/{id}/purge")]
+    public async Task<IActionResult> PurgeFile(int id)
+    {
+        var userId = GetUserId();
+        var file = await _context.Files.FindAsync(id);
+        
+        if (file == null) return NotFound();
+        if (file.OwnerId != userId) return Forbid();
+
+        // Hard delete
+        _context.Files.Remove(file);
+        // Also delete physical file
+        if (System.IO.File.Exists(file.PhysicalPath))
+        {
+            System.IO.File.Delete(file.PhysicalPath);
+        }
+        await _context.SaveChangesAsync();
+
+        return Ok(new { Message = "File permanently deleted" });
+    }
+
+    [HttpGet("recent")]
+    public async Task<IActionResult> GetRecentFiles()
+    {
+        var userId = GetUserId();
+        var recentFiles = await _context.Files
+            .Where(f => f.OwnerId == userId && !f.IsDeleted)
+            .OrderByDescending(f => f.UploadDate)
+            .Take(20)
+            .Select(f => new 
+            { 
+                f.Id, 
+                f.Name, 
+                f.Extension, 
+                f.Size, 
+                f.UploadDate, 
+                f.FolderId 
+            })
+            .ToListAsync();
+
+        return Ok(new { Files = recentFiles });
+    }
+
+    [HttpGet("downloads")]
+    public async Task<IActionResult> GetDownloads()
+    {
+        var userId = GetUserId();
+        
+        // Find or create "Downloads" folder
+        var downloadsFolder = await _context.Folders
+            .FirstOrDefaultAsync(f => f.OwnerId == userId && f.Name == "Downloads" && f.ParentFolderId == null);
+
+        if (downloadsFolder == null)
+        {
+            downloadsFolder = new Folder
+            {
+                Name = "Downloads",
+                OwnerId = userId,
+                ParentFolderId = null // Root level
+            };
+            _context.Folders.Add(downloadsFolder);
+            await _context.SaveChangesAsync();
+        }
+
+        return await GetFolderContents(downloadsFolder.Id);
     }
 }
 
