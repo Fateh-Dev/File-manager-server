@@ -16,4 +16,6 @@ public class Folder
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public ICollection<Folder> SubFolders { get; set; } = new List<Folder>();
     public ICollection<FileMetadata> Files { get; set; } = new List<FileMetadata>();
+    public bool IsDeleted { get; set; } = false;
+    public DateTime? DeletedAt { get; set; }
 }

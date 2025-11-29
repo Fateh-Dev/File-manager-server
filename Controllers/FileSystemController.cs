@@ -50,8 +50,8 @@ public class FileSystemController : ControllerBase
         return Ok(new { 
             id = folder.Id, 
             name = folder.Name, 
-            subFolders = folder.SubFolders.Select(f => new { id = f.Id, name = f.Name }),
-            files = folder.Files.Select(f => new { id = f.Id, name = f.Name, extension = f.Extension, size = f.Size, uploadDate = f.UploadDate })
+            subFolders = folder.SubFolders.Where(f => !f.IsDeleted).Select(f => new { id = f.Id, name = f.Name }),
+            files = folder.Files.Where(f => !f.IsDeleted).Select(f => new { id = f.Id, name = f.Name, extension = f.Extension, size = f.Size, uploadDate = f.UploadDate })
         });
     }
 
@@ -170,21 +170,74 @@ public class FileSystemController : ControllerBase
             if (folder.OwnerId != userId && !await HasPermission(userId, folderId, null, AccessLevel.Edit))
                 return Forbid();
 
-            // Check if folder has subfolders or files
-            if (folder.SubFolders != null && folder.SubFolders.Any())
-                return BadRequest(new { Error = "Cannot delete folder with subfolders. Please delete subfolders first." });
-            
-            if (folder.Files != null && folder.Files.Any())
-                return BadRequest(new { Error = "Cannot delete folder with files. Please delete files first." });
-
-            _context.Folders.Remove(folder);
+            // Recursive soft delete
+            await SoftDeleteFolderRecursive(folder);
             await _context.SaveChangesAsync();
 
-            return Ok(new { Message = "Folder deleted successfully" });
+            return Ok(new { Message = "Folder and contents moved to Recycle Bin" });
         }
         catch (Exception ex)
         {
             return StatusCode(500, new { Error = ex.Message });
+        }
+    }
+
+    [HttpDelete("file/{fileId}")]
+    public async Task<IActionResult> DeleteFile(int fileId)
+    {
+        try
+        {
+            var userId = GetUserId();
+            var file = await _context.Files.FindAsync(fileId);
+            
+            if (file == null) return NotFound();
+            
+            if (file.OwnerId != userId && !await HasPermission(userId, null, fileId, AccessLevel.Edit))
+                return Forbid();
+
+            file.IsDeleted = true;
+            file.DeletedAt = DateTime.UtcNow;
+            await _context.SaveChangesAsync();
+
+            return Ok(new { Message = "File moved to Recycle Bin" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { Error = ex.Message });
+        }
+    }
+
+    private async Task SoftDeleteFolderRecursive(Folder folder)
+    {
+        folder.IsDeleted = true;
+        folder.DeletedAt = DateTime.UtcNow;
+
+        // Load subfolders and files if not already loaded (though we included them in the query, 
+        // for deep recursion we might need to load them or use a different strategy. 
+        // For now, let's assume we need to load them for deep levels or use a raw SQL query for efficiency.
+        // But EF Core fix-up might not load grandchildren. 
+        // Let's explicitly load children for recursion if needed, or use a loop.
+        // Actually, for a proper recursive delete, we should probably load the entire tree or do it iteratively.
+        // Given the potential depth, let's load children explicitly.
+        
+        var subFolders = await _context.Folders
+            .Include(f => f.Files)
+            .Where(f => f.ParentFolderId == folder.Id && !f.IsDeleted)
+            .ToListAsync();
+
+        foreach (var subFolder in subFolders)
+        {
+            await SoftDeleteFolderRecursive(subFolder);
+        }
+
+        var files = await _context.Files
+            .Where(f => f.FolderId == folder.Id && !f.IsDeleted)
+            .ToListAsync();
+
+        foreach (var file in files)
+        {
+            file.IsDeleted = true;
+            file.DeletedAt = DateTime.UtcNow;
         }
     }
 
@@ -315,40 +368,34 @@ public class FileSystemController : ControllerBase
         var userId = GetUserId();
         var lowerQuery = query.ToLower();
 
-        // Search folders
-        var folders = await _context.Folders
-            .Where(f => f.Name.ToLower().Contains(lowerQuery))
-            .ToListAsync();
+        // Search folders - using GroupJoin for better query performance and correctness
+        var foldersQuery = from folder in _context.Folders
+                          where folder.Name.ToLower().Contains(lowerQuery) && !folder.IsDeleted
+                          join permission in _context.Permissions 
+                              on folder.Id equals permission.FolderId into perms
+                          from perm in perms.DefaultIfEmpty()
+                          where folder.OwnerId == userId || 
+                                (perm != null && perm.UserId == userId && perm.AccessLevel >= AccessLevel.Read)
+                          select new { id = folder.Id, name = folder.Name, parentFolderId = folder.ParentFolderId };
 
-        // Filter folders by permission
-        var accessibleFolders = new List<object>();
-        foreach (var folder in folders)
-        {
-            if (folder.OwnerId == userId || await HasPermission(userId, folder.Id, null, AccessLevel.Read))
-            {
-                accessibleFolders.Add(new { id = folder.Id, name = folder.Name, parentFolderId = folder.ParentFolderId });
-            }
-        }
+        var folders = await foldersQuery.Distinct().ToListAsync();
 
-        // Search files
-        var files = await _context.Files
-            .Where(f => f.Name.ToLower().Contains(lowerQuery))
-            .ToListAsync();
+        // Search files - using GroupJoin for better query performance and correctness
+        var filesQuery = from file in _context.Files
+                        where file.Name.ToLower().Contains(lowerQuery) && !file.IsDeleted
+                        join permission in _context.Permissions 
+                            on file.Id equals permission.FileId into perms
+                        from perm in perms.DefaultIfEmpty()
+                        where file.OwnerId == userId || 
+                              (perm != null && perm.UserId == userId && perm.AccessLevel >= AccessLevel.Read)
+                        select new { id = file.Id, name = file.Name, extension = file.Extension, size = file.Size, uploadDate = file.UploadDate, folderId = file.FolderId };
 
-        // Filter files by permission
-        var accessibleFiles = new List<object>();
-        foreach (var file in files)
-        {
-            if (file.OwnerId == userId || await HasPermission(userId, null, file.Id, AccessLevel.Read))
-            {
-                accessibleFiles.Add(new { id = file.Id, name = file.Name, extension = file.Extension, size = file.Size, uploadDate = file.UploadDate, folderId = file.FolderId });
-            }
-        }
+        var files = await filesQuery.Distinct().ToListAsync();
 
         return Ok(new
         {
-            folders = accessibleFolders,
-            files = accessibleFiles
+            folders = folders,
+            files = files
         });
     }
 

@@ -15,4 +15,6 @@ public class FileMetadata
     public int OwnerId { get; set; }
     public User? Owner { get; set; }
     public DateTime UploadDate { get; set; } = DateTime.UtcNow;
+    public bool IsDeleted { get; set; } = false;
+    public DateTime? DeletedAt { get; set; }
 }
