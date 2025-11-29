@@ -22,7 +22,12 @@ public class FileSystemController : ControllerBase
         _fileStorage = fileStorage;
     }
 
-    private int GetUserId() => int.Parse(User.FindFirst("id")!.Value);
+    private int GetUserId()
+    {
+        var idClaim = User.FindFirst("id");
+        if (idClaim == null) throw new UnauthorizedAccessException("User ID claim not found");
+        return int.Parse(idClaim.Value);
+    }
 
     [HttpGet("folder/{folderId}")]
     public async Task<IActionResult> GetFolderContents(int folderId)
@@ -74,7 +79,7 @@ public class FileSystemController : ControllerBase
             _context.Folders.Add(folder);
             await _context.SaveChangesAsync();
 
-            return Ok(folder);
+            return Ok(new { id = folder.Id, name = folder.Name, parentFolderId = folder.ParentFolderId });
         }
         catch (Exception ex)
         {
@@ -141,7 +146,7 @@ public class FileSystemController : ControllerBase
             folder.Name = dto.Name;
             await _context.SaveChangesAsync();
 
-            return Ok(folder);
+            return Ok(new { id = folder.Id, name = folder.Name, parentFolderId = folder.ParentFolderId });
         }
         catch (Exception ex)
         {
@@ -199,35 +204,93 @@ public class FileSystemController : ControllerBase
             // Check if target folder exists and user has permission
             if (dto.TargetFolderId.HasValue)
             {
+                // Prevent moving folder into itself
+                if (dto.TargetFolderId.Value == folderId)
+                    return BadRequest(new { Error = "Cannot move folder into itself" });
+
                 var targetFolder = await _context.Folders.FindAsync(dto.TargetFolderId.Value);
                 if (targetFolder == null) return NotFound("Target folder not found");
                 
                 if (targetFolder.OwnerId != userId && !await HasPermission(userId, dto.TargetFolderId.Value, null, AccessLevel.Edit))
                     return Forbid("No permission to move folder here");
                 
-                // Prevent moving folder into itself or its descendants
-                if (dto.TargetFolderId.Value == folderId)
-                    return BadRequest(new { Error = "Cannot move folder into itself" });
-                
-                // Check if target is a descendant
-                var current = await _context.Folders.FindAsync(dto.TargetFolderId.Value);
-                while (current != null && current.ParentFolderId.HasValue)
+                // Check if target is a descendant using projection to avoid tracking issues
+                var currentId = dto.TargetFolderId.Value;
+                while (true)
                 {
-                    if (current.ParentFolderId.Value == folderId)
+                    // Get parent ID of the current node
+                    var parentId = await _context.Folders
+                        .Where(f => f.Id == currentId)
+                        .Select(f => f.ParentFolderId)
+                        .FirstOrDefaultAsync();
+
+                    if (parentId == folderId)
                         return BadRequest(new { Error = "Cannot move folder into its own subfolder" });
-                    current = await _context.Folders.FindAsync(current.ParentFolderId.Value);
+                    
+                    if (parentId == null) break;
+                    currentId = parentId.Value;
+                    
+                    // Safety break for potential infinite loops in DB cycles (though unlikely)
+                    if (currentId == dto.TargetFolderId.Value) break; 
                 }
             }
 
             folder.ParentFolderId = dto.TargetFolderId;
             await _context.SaveChangesAsync();
 
-            return Ok(folder);
+            return Ok(new { id = folder.Id, name = folder.Name, parentFolderId = folder.ParentFolderId });
         }
         catch (Exception ex)
         {
-            return StatusCode(500, new { Error = ex.Message });
+            Console.WriteLine($"MoveFolder Error: {ex}");
+            return StatusCode(500, new { Error = ex.Message, StackTrace = ex.StackTrace });
         }
+    }
+
+    [HttpGet("search")]
+    public async Task<IActionResult> Search([FromQuery] string query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return BadRequest("Search query cannot be empty");
+
+        var userId = GetUserId();
+        var lowerQuery = query.ToLower();
+
+        // Search folders
+        var folders = await _context.Folders
+            .Where(f => f.Name.ToLower().Contains(lowerQuery))
+            .ToListAsync();
+
+        // Filter folders by permission
+        var accessibleFolders = new List<object>();
+        foreach (var folder in folders)
+        {
+            if (folder.OwnerId == userId || await HasPermission(userId, folder.Id, null, AccessLevel.Read))
+            {
+                accessibleFolders.Add(new { id = folder.Id, name = folder.Name });
+            }
+        }
+
+        // Search files
+        var files = await _context.Files
+            .Where(f => f.Name.ToLower().Contains(lowerQuery))
+            .ToListAsync();
+
+        // Filter files by permission
+        var accessibleFiles = new List<object>();
+        foreach (var file in files)
+        {
+            if (file.OwnerId == userId || await HasPermission(userId, null, file.Id, AccessLevel.Read))
+            {
+                accessibleFiles.Add(new { id = file.Id, name = file.Name, extension = file.Extension, size = file.Size, uploadDate = file.UploadDate });
+            }
+        }
+
+        return Ok(new
+        {
+            folders = accessibleFolders,
+            files = accessibleFiles
+        });
     }
 
     private async Task<bool> HasPermission(int userId, int? folderId, int? fileId, AccessLevel level)
