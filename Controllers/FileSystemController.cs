@@ -29,6 +29,29 @@ public class FileSystemController : ControllerBase
         return int.Parse(idClaim.Value);
     }
 
+    [HttpGet("root")]
+    public async Task<IActionResult> GetRootFolder()
+    {
+        var userId = GetUserId();
+        var rootFolder = await _context.Folders
+            .FirstOrDefaultAsync(f => f.OwnerId == userId && f.ParentFolderId == null && !f.IsDeleted);
+        
+        if (rootFolder == null)
+        {
+            // Create root folder if it doesn't exist
+            rootFolder = new Folder
+            {
+                Name = "Root",
+                OwnerId = userId,
+                ParentFolderId = null
+            };
+            _context.Folders.Add(rootFolder);
+            await _context.SaveChangesAsync();
+        }
+        
+        return Ok(new { id = rootFolder.Id, name = rootFolder.Name });
+    }
+
     [HttpGet("folder/{folderId}")]
     public async Task<IActionResult> GetFolderContents(int folderId)
     {
@@ -62,16 +85,35 @@ public class FileSystemController : ControllerBase
         {
             var userId = GetUserId();
             
+            // Validate folder name
+            if (string.IsNullOrWhiteSpace(dto.Name))
+            {
+                return BadRequest(new { Error = "Folder name cannot be empty" });
+            }
+            
             // Check parent folder permissions
             if (dto.ParentFolderId.HasValue)
             {
-                 if (!await HasPermission(userId, dto.ParentFolderId.Value, null, AccessLevel.Edit))
-                     return Forbid();
+                var parentFolder = await _context.Folders.FindAsync(dto.ParentFolderId.Value);
+                if (parentFolder == null)
+                {
+                    return NotFound(new { Error = $"Parent folder with ID {dto.ParentFolderId.Value} not found" });
+                }
+                
+                if (parentFolder.IsDeleted)
+                {
+                    return BadRequest(new { Error = "Cannot create folder in a deleted folder" });
+                }
+                
+                if (!await HasPermission(userId, dto.ParentFolderId.Value, null, AccessLevel.Edit))
+                {
+                    return Forbid();
+                }
             }
 
             var folder = new Folder
             {
-                Name = dto.Name,
+                Name = dto.Name.Trim(),
                 ParentFolderId = dto.ParentFolderId,
                 OwnerId = userId
             };
@@ -83,6 +125,7 @@ public class FileSystemController : ControllerBase
         }
         catch (Exception ex)
         {
+            Console.WriteLine($"CreateFolder Error: {ex}");
             return StatusCode(500, new { Error = ex.Message, StackTrace = ex.StackTrace });
         }
     }
