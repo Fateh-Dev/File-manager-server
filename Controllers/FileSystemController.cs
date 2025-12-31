@@ -141,6 +141,15 @@ public class FileSystemController : ControllerBase
         var file = dto.File;
         if (file == null || file.Length == 0) return BadRequest("No file uploaded");
 
+        // Check storage quota
+        var user = await _context.Users.FindAsync(userId);
+        if (user == null) return Unauthorized();
+
+        if (user.UsedStorage + file.Length > user.StorageLimit)
+        {
+            return BadRequest(new { Error = "Storage quota exceeded. Please delete some files or contact an administrator." });
+        }
+
         var path = await _fileStorage.SaveFileAsync(file.OpenReadStream(), file.FileName);
 
         var metadata = new FileMetadata
@@ -154,6 +163,10 @@ public class FileSystemController : ControllerBase
         };
 
         _context.Files.Add(metadata);
+        
+        // Update user storage usage
+        user.UsedStorage += file.Length;
+        
         await _context.SaveChangesAsync();
 
         return Ok(new 

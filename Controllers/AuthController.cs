@@ -3,6 +3,7 @@ using FileManager.API.Models;
 using FileManager.API.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Authorization;
 
 namespace FileManager.API.Controllers;
 
@@ -27,11 +28,15 @@ public class AuthController : ControllerBase
             return BadRequest("Username already exists");
         }
 
+        // Check if this is the first user
+        bool isFirstUser = !await _context.Users.AnyAsync();
+
         var user = new User
         {
             Username = dto.Username,
             PasswordHash = _authService.HashPassword(dto.Password),
-            Role = "User"
+            Role = isFirstUser ? "Admin" : "User",
+            IsActive = isFirstUser
         };
 
         _context.Users.Add(user);
@@ -61,6 +66,11 @@ public class AuthController : ControllerBase
                 return Unauthorized("Invalid credentials");
             }
 
+            if (!user.IsActive)
+            {
+                return Unauthorized("Account is inactive. Please contact an administrator.");
+            }
+
             var token = _authService.GenerateJwtToken(user);
             return Ok(new { Token = token });
         }
@@ -68,6 +78,26 @@ public class AuthController : ControllerBase
         {
             return StatusCode(500, new { Error = ex.Message, StackTrace = ex.StackTrace });
         }
+    }
+    [Authorize]
+    [HttpGet("me")]
+    public async Task<IActionResult> GetMe()
+    {
+        var username = User.Identity?.Name;
+        if (string.IsNullOrEmpty(username)) return Unauthorized();
+
+        var user = await _context.Users.FirstOrDefaultAsync(u => u.Username == username);
+        if (user == null) return NotFound();
+
+        return Ok(new
+        {
+            user.Id,
+            user.Username,
+            user.Role,
+            user.IsActive,
+            user.StorageLimit,
+            user.UsedStorage
+        });
     }
 }
 
