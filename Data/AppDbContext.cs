@@ -11,6 +11,7 @@ public class AppDbContext : DbContext
     public DbSet<Folder> Folders { get; set; }
     public DbSet<FileMetadata> Files { get; set; }
     public DbSet<Permission> Permissions { get; set; }
+    public DbSet<SharedLink> SharedLinks { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -18,6 +19,10 @@ public class AppDbContext : DbContext
 
         modelBuilder.Entity<User>()
             .HasIndex(u => u.Username)
+            .IsUnique();
+
+        modelBuilder.Entity<SharedLink>()
+            .HasIndex(s => s.Token)
             .IsUnique();
     }
 }
