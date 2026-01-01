@@ -10,173 +10,187 @@ namespace FileManager.API.Controllers;
 
 [Route("api/[controller]")]
 [ApiController]
+[Authorize]
 public class SharingController : ControllerBase
 {
     private readonly AppDbContext _context;
-    private readonly IFileStorageService _fileStorage;
 
-    public SharingController(AppDbContext context, IFileStorageService fileStorage)
+    public SharingController(AppDbContext context)
     {
         _context = context;
-        _fileStorage = fileStorage;
     }
 
-    private int? GetUserId()
+    private int GetUserId()
     {
         var idClaim = User.FindFirst("id");
-        return idClaim != null ? int.Parse(idClaim.Value) : null;
+        if (idClaim == null)
+        {
+            // Try claim types name identifier
+            idClaim = User.FindFirst(ClaimTypes.NameIdentifier);
+        }
+        return idClaim != null ? int.Parse(idClaim.Value) : 0;
     }
 
-    [HttpPost("links")]
-    [Authorize]
-    public async Task<IActionResult> CreateShareLink(CreateShareLinkDto dto)
+    [HttpPost("share")]
+    public async Task<IActionResult> ShareWithUser(ShareRequestDto dto)
     {
-        var userId = GetUserId()!.Value;
+        var currentUserId = GetUserId();
 
-        // Verify ownership
+        // 1. Verify ownership
         if (dto.FileId.HasValue)
         {
             var file = await _context.Files.FindAsync(dto.FileId.Value);
-            if (file == null || file.OwnerId != userId) return Forbid();
+            if (file == null) return NotFound("File not found");
+            if (file.OwnerId != currentUserId) return Forbid();
         }
         else if (dto.FolderId.HasValue)
         {
             var folder = await _context.Folders.FindAsync(dto.FolderId.Value);
-            if (folder == null || folder.OwnerId != userId) return Forbid();
+            if (folder == null) return NotFound("Folder not found");
+            if (folder.OwnerId != currentUserId) return Forbid();
         }
         else
         {
             return BadRequest("FileId or FolderId must be provided");
         }
 
-        var token = Guid.NewGuid().ToString("n")[..12]; // Short token
-
-        var sharedLink = new SharedLink
+        // 2. Clear existing permission if any (to update)
+        var existing = await _context.Permissions
+            .FirstOrDefaultAsync(p => p.UserId == dto.TargetUserId && 
+                                    p.FileId == dto.FileId && 
+                                    p.FolderId == dto.FolderId);
+        if (existing != null)
         {
-            Token = token,
+            _context.Permissions.Remove(existing);
+        }
+
+        // 3. Create new permission
+        var permission = new Permission
+        {
+            UserId = dto.TargetUserId,
             FileId = dto.FileId,
             FolderId = dto.FolderId,
-            CreatorId = userId,
-            ExpirationDate = dto.ExpirationDate,
-            CreatedAt = DateTime.UtcNow
+            AccessLevel = dto.AccessLevel
         };
 
-        _context.SharedLinks.Add(sharedLink);
+        _context.Permissions.Add(permission);
         await _context.SaveChangesAsync();
 
-        return Ok(sharedLink);
+        return Ok(new { message = "Item shared successfully" });
     }
 
-    [HttpGet("info/{token}")]
-    [AllowAnonymous]
-    public async Task<IActionResult> GetSharedInfo(string token)
+    [HttpGet("shared-with-me")]
+    public async Task<IActionResult> GetSharedWithMe()
     {
-        var sharedLink = await _context.SharedLinks
-            .Include(s => s.File)
-            .Include(s => s.Folder)
-                .ThenInclude(f => f!.SubFolders)
-            .Include(s => s.Folder)
-                .ThenInclude(f => f!.Files)
-            .FirstOrDefaultAsync(s => s.Token == token);
+        var userId = GetUserId();
 
-        if (sharedLink == null) return NotFound("Link not found");
-
-        if (sharedLink.ExpirationDate.HasValue && sharedLink.ExpirationDate < DateTime.UtcNow)
-        {
-            return BadRequest("This link has expired");
-        }
-
-        if (sharedLink.FileId.HasValue)
-        {
-            if (sharedLink.File == null || sharedLink.File.IsDeleted) return NotFound("File no longer available");
-            return Ok(new
+        var sharedItems = await _context.Permissions
+            .Where(p => p.UserId == userId)
+            .Include(p => p.File)
+                .ThenInclude(f => f!.Owner)
+            .Include(p => p.Folder)
+                .ThenInclude(f => f!.Owner)
+            .Select(p => new
             {
-                type = "file",
-                name = sharedLink.File.Name,
-                size = sharedLink.File.Size,
-                extension = sharedLink.File.Extension,
-                uploadDate = sharedLink.File.UploadDate
-            });
-        }
-        else if (sharedLink.FolderId.HasValue)
-        {
-            if (sharedLink.Folder == null || sharedLink.Folder.IsDeleted) return NotFound("Folder no longer available");
-            return Ok(new
-            {
-                type = "folder",
-                name = sharedLink.Folder.Name,
-                subFolders = sharedLink.Folder.SubFolders.Where(f => !f.IsDeleted).Select(f => new { id = f.Id, name = f.Name }),
-                files = sharedLink.Folder.Files.Where(f => !f.IsDeleted).Select(f => new { id = f.Id, name = f.Name, extension = f.Extension, size = f.Size })
-            });
-        }
-
-        return BadRequest("Invalid shared link");
-    }
-
-    [HttpGet("download/{token}")]
-    [AllowAnonymous]
-    public async Task<IActionResult> DownloadSharedFile(string token)
-    {
-        var sharedLink = await _context.SharedLinks
-            .Include(s => s.File)
-            .FirstOrDefaultAsync(s => s.Token == token);
-
-        if (sharedLink == null || !sharedLink.FileId.HasValue) return NotFound();
-
-        if (sharedLink.ExpirationDate.HasValue && sharedLink.ExpirationDate < DateTime.UtcNow)
-        {
-            return BadRequest("Link expired");
-        }
-
-        var file = sharedLink.File;
-        if (file == null || file.IsDeleted) return NotFound();
-
-        var stream = await _fileStorage.GetFileAsync(file.PhysicalPath);
-        return File(stream, "application/octet-stream", file.Name);
-    }
-
-    [HttpGet("my-links")]
-    [Authorize]
-    public async Task<IActionResult> GetMyLinks()
-    {
-        var userId = GetUserId()!.Value;
-        var links = await _context.SharedLinks
-            .Where(l => l.CreatorId == userId)
-            .Include(l => l.File)
-            .Include(l => l.Folder)
-            .OrderByDescending(l => l.CreatedAt)
+                p.Id,
+                p.AccessLevel,
+                Type = p.FileId.HasValue ? "file" : "folder",
+                Item = p.FileId.HasValue ? (object)new {
+                    id = p.File!.Id,
+                    name = p.File.Name,
+                    size = p.File.Size,
+                    extension = p.File.Extension,
+                    uploadDate = p.File.UploadDate,
+                    ownerName = p.File.Owner != null ? p.File.Owner.Username : "Inconnu"
+                } : new {
+                    id = p.Folder!.Id,
+                    name = p.Folder.Name,
+                    ownerName = p.Folder.Owner != null ? p.Folder.Owner.Username : "Inconnu"
+                }
+            })
             .ToListAsync();
 
-        return Ok(links.Select(l => new {
-            l.Id,
-            l.Token,
-            l.CreatedAt,
-            l.ExpirationDate,
-            itemName = l.File?.Name ?? l.Folder?.Name,
-            type = l.FileId.HasValue ? "file" : "folder"
-        }));
+        return Ok(sharedItems);
     }
 
-    [HttpDelete("links/{id}")]
-    [Authorize]
-    public async Task<IActionResult> RevokeLink(int id)
+    [HttpGet("item-permissions")]
+    public async Task<IActionResult> GetItemPermissions([FromQuery] int? fileId, [FromQuery] int? folderId)
     {
-        var userId = GetUserId()!.Value;
-        var link = await _context.SharedLinks.FindAsync(id);
+        var currentUserId = GetUserId();
 
-        if (link == null) return NotFound();
-        if (link.CreatorId != userId) return Forbid();
+        if (!fileId.HasValue && !folderId.HasValue)
+            return BadRequest("FileId or FolderId must be provided");
 
-        _context.SharedLinks.Remove(link);
+        // Verify ownership
+        if (fileId.HasValue)
+        {
+            var file = await _context.Files.FindAsync(fileId.Value);
+            if (file == null) return NotFound("File not found");
+            if (file.OwnerId != currentUserId) return Forbid();
+        }
+        else if (folderId.HasValue)
+        {
+            var folder = await _context.Folders.FindAsync(folderId.Value);
+            if (folder == null) return NotFound("Folder not found");
+            if (folder.OwnerId != currentUserId) return Forbid();
+        }
+
+        var permissions = await _context.Permissions
+            .Where(p => (fileId.HasValue && p.FileId == fileId) || (folderId.HasValue && p.FolderId == folderId))
+            .Include(p => p.User)
+            .Select(p => new
+            {
+                p.Id,
+                p.UserId,
+                Username = p.User != null ? p.User.Username : "Inconnu",
+                p.AccessLevel
+            })
+            .ToListAsync();
+
+        return Ok(permissions);
+    }
+
+    [HttpGet("users")]
+    public async Task<IActionResult> GetUsers()
+    {
+        var currentUserId = GetUserId();
+        var users = await _context.Users
+            .Where(u => u.Id != currentUserId && u.IsActive)
+            .Select(u => new { u.Id, u.Username })
+            .ToListAsync();
+
+        return Ok(users);
+    }
+
+    [HttpDelete("revoke/{permissionId}")]
+    public async Task<IActionResult> RevokeShare(int permissionId)
+    {
+        var currentUserId = GetUserId();
+        var permission = await _context.Permissions
+            .Include(p => p.File)
+            .Include(p => p.Folder)
+            .FirstOrDefaultAsync(p => p.Id == permissionId);
+
+        if (permission == null) return NotFound();
+
+        // Only owner can revoke
+        bool isOwner = false;
+        if (permission.FileId.HasValue) isOwner = permission.File!.OwnerId == currentUserId;
+        else if (permission.FolderId.HasValue) isOwner = permission.Folder!.OwnerId == currentUserId;
+
+        if (!isOwner) return Forbid();
+
+        _context.Permissions.Remove(permission);
         await _context.SaveChangesAsync();
 
-        return Ok(new { message = "Link revoked successfully" });
+        return Ok(new { message = "Sharing revoked" });
     }
 }
 
-public class CreateShareLinkDto
+public class ShareRequestDto
 {
+    public int TargetUserId { get; set; }
     public int? FileId { get; set; }
     public int? FolderId { get; set; }
-    public DateTime? ExpirationDate { get; set; }
+    public AccessLevel AccessLevel { get; set; } = AccessLevel.Read;
 }
