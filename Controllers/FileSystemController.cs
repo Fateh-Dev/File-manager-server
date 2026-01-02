@@ -58,23 +58,56 @@ public class FileSystemController : ControllerBase
         var userId = GetUserId();
         
         var folder = await _context.Folders
+            .Include(f => f.Owner)
             .Include(f => f.SubFolders)
+                .ThenInclude(sf => sf.Owner)
             .Include(f => f.Files)
+                .ThenInclude(file => file.Owner)
             .FirstOrDefaultAsync(f => f.Id == folderId);
 
         if (folder == null) return NotFound();
 
         // Basic permission check: Owner or has permission
-        if (folder.OwnerId != userId && !await HasPermission(userId, folderId, null, AccessLevel.Read))
+        var effectiveAccessLevel = await GetEffectiveAccessLevel(userId, folderId, null);
+        if (folder.OwnerId != userId && (effectiveAccessLevel == null || effectiveAccessLevel < AccessLevel.Read))
         {
              return Forbid();
+        }
+
+        var subFolders = new List<object>();
+        foreach (var f in folder.SubFolders.Where(f => !f.IsDeleted))
+        {
+            var level = await GetEffectiveAccessLevel(userId, f.Id, null);
+            subFolders.Add(new { 
+                id = f.Id, 
+                name = f.Name, 
+                ownerName = f.Owner?.Username ?? "Inconnu",
+                accessLevel = (int)(level ?? AccessLevel.Read) // Default to Read if parent is shared
+            });
+        }
+
+        var files = new List<object>();
+        foreach (var f in folder.Files.Where(f => !f.IsDeleted))
+        {
+            var level = await GetEffectiveAccessLevel(userId, null, f.Id);
+            files.Add(new { 
+                id = f.Id, 
+                name = f.Name, 
+                extension = f.Extension, 
+                size = f.Size, 
+                uploadDate = f.UploadDate,
+                ownerName = f.Owner?.Username ?? "Inconnu",
+                accessLevel = (int)(level ?? AccessLevel.Read)
+            });
         }
 
         return Ok(new { 
             id = folder.Id, 
             name = folder.Name, 
-            subFolders = folder.SubFolders.Where(f => !f.IsDeleted).Select(f => new { id = f.Id, name = f.Name }),
-            files = folder.Files.Where(f => !f.IsDeleted).Select(f => new { id = f.Id, name = f.Name, extension = f.Extension, size = f.Size, uploadDate = f.UploadDate })
+            ownerName = folder.Owner?.Username ?? "Inconnu",
+            accessLevel = (int)(effectiveAccessLevel ?? AccessLevel.Read),
+            subFolders = subFolders,
+            files = files
         });
     }
 
@@ -432,63 +465,138 @@ public class FileSystemController : ControllerBase
         var userId = GetUserId();
         var lowerQuery = query.ToLower();
 
-        // Search folders - using GroupJoin for better query performance and correctness
-        var foldersQuery = from folder in _context.Folders
-                          where folder.Name.ToLower().Contains(lowerQuery) && !folder.IsDeleted
-                          join permission in _context.Permissions 
-                              on folder.Id equals permission.FolderId into perms
-                          from perm in perms.DefaultIfEmpty()
-                          where folder.OwnerId == userId || 
-                                (perm != null && perm.UserId == userId && perm.AccessLevel >= AccessLevel.Read)
-                          select new { id = folder.Id, name = folder.Name, parentFolderId = folder.ParentFolderId };
+        // 1. Get all potential matches
+        var allMatchingFolders = await _context.Folders
+            .Include(f => f.Owner)
+            .Where(f => f.Name.ToLower().Contains(lowerQuery) && !f.IsDeleted)
+            .ToListAsync();
 
-        var folders = await foldersQuery.Distinct().ToListAsync();
+        var allMatchingFiles = await _context.Files
+            .Include(f => f.Owner)
+            .Where(f => f.Name.ToLower().Contains(lowerQuery) && !f.IsDeleted)
+            .ToListAsync();
 
-        // Search files - using GroupJoin for better query performance and correctness
-        var filesQuery = from file in _context.Files
-                        where file.Name.ToLower().Contains(lowerQuery) && !file.IsDeleted
-                        join permission in _context.Permissions 
-                            on file.Id equals permission.FileId into perms
-                        from perm in perms.DefaultIfEmpty()
-                        where file.OwnerId == userId || 
-                              (perm != null && perm.UserId == userId && perm.AccessLevel >= AccessLevel.Read)
-                        select new { id = file.Id, name = file.Name, extension = file.Extension, size = file.Size, uploadDate = file.UploadDate, folderId = file.FolderId };
+        // 2. Filter based on effective permissions
+        var visibleFolders = new List<object>();
+        foreach (var folder in allMatchingFolders)
+        {
+            var level = await GetEffectiveAccessLevel(userId, folder.Id, null);
+            if (level != null)
+            {
+                visibleFolders.Add(new { 
+                    id = folder.Id, 
+                    name = folder.Name, 
+                    parentFolderId = folder.ParentFolderId,
+                    ownerName = folder.Owner?.Username ?? "Inconnu",
+                    accessLevel = (int)level
+                });
+            }
+        }
 
-        var files = await filesQuery.Distinct().ToListAsync();
+        var visibleFiles = new List<object>();
+        foreach (var file in allMatchingFiles)
+        {
+            var level = await GetEffectiveAccessLevel(userId, null, file.Id);
+            if (level != null)
+            {
+                visibleFiles.Add(new { 
+                    id = file.Id, 
+                    name = file.Name, 
+                    extension = file.Extension, 
+                    size = file.Size, 
+                    uploadDate = file.UploadDate, 
+                    folderId = file.FolderId,
+                    ownerName = file.Owner?.Username ?? "Inconnu",
+                    accessLevel = (int)level
+                });
+            }
+        }
 
         return Ok(new
         {
-            folders = folders,
-            files = files
+            folders = visibleFolders,
+            files = visibleFiles
         });
     }
 
     private async Task<bool> HasPermission(int userId, int? folderId, int? fileId, AccessLevel level)
     {
+        var effectiveLevel = await GetEffectiveAccessLevel(userId, folderId, fileId);
+        if (effectiveLevel == null) return false;
+        return (int)effectiveLevel.Value >= (int)level;
+    }
+
+    private async Task<AccessLevel?> GetEffectiveAccessLevel(int userId, int? folderId, int? fileId)
+    {
         try
         {
-            // Check ownership first
+            // 1. Direct Ownership Check
             if (folderId.HasValue)
             {
                 var folder = await _context.Folders.FindAsync(folderId.Value);
-                if (folder != null && folder.OwnerId == userId) return true;
+                if (folder != null && folder.OwnerId == userId) return AccessLevel.Delete; // Owner has full access
             }
             if (fileId.HasValue)
             {
                 var file = await _context.Files.FindAsync(fileId.Value);
-                if (file != null && file.OwnerId == userId) return true;
+                if (file != null && file.OwnerId == userId) return AccessLevel.Delete;
             }
 
-            // Check explicit permissions
-            return await _context.Permissions.AnyAsync(p => 
-                p.UserId == userId && 
-                (p.FolderId == folderId || p.FileId == fileId) && 
-                p.AccessLevel >= level);
+            // 2. Direct Permission Check
+            var directPerm = await _context.Permissions
+                .Where(p => p.UserId == userId && (p.FolderId == folderId || (fileId.HasValue && p.FileId == fileId)))
+                .OrderByDescending(p => p.AccessLevel)
+                .Select(p => (AccessLevel?)p.AccessLevel)
+                .FirstOrDefaultAsync();
+
+            // If we found a direct permission, it might be higher than inherited ones, but in inheritance logic,
+            // usually the most specific one or the highest one wins. We'll compare with parent later.
+            AccessLevel? currentMax = directPerm;
+
+            // 3. Inheritance Check (Crawl up the tree)
+            int? currentFolderId = folderId;
+            
+            // If checking a file, start from its parent folder
+            if (fileId.HasValue && !folderId.HasValue)
+            {
+                currentFolderId = await _context.Files
+                    .Where(f => f.Id == fileId.Value)
+                    .Select(f => f.FolderId)
+                    .FirstOrDefaultAsync();
+            }
+
+            // Maximum depth to prevent infinite loops (safety)
+            int depth = 0;
+            while (currentFolderId.HasValue && depth < 50)
+            {
+                var parentPerm = await _context.Permissions
+                    .Where(p => p.UserId == userId && p.FolderId == currentFolderId.Value)
+                    .Select(p => (AccessLevel?)p.AccessLevel)
+                    .FirstOrDefaultAsync();
+
+                if (parentPerm.HasValue && (currentMax == null || parentPerm > currentMax))
+                {
+                    currentMax = parentPerm;
+                }
+
+                // If we already have Edit/Delete, we can probably stop (Read < Edit < Delete)
+                if (currentMax >= AccessLevel.Edit) break;
+
+                // Move to parent
+                currentFolderId = await _context.Folders
+                    .Where(f => f.Id == currentFolderId.Value)
+                    .Select(f => f.ParentFolderId)
+                    .FirstOrDefaultAsync();
+                
+                depth++;
+            }
+
+            return currentMax;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"HasPermission error: {ex.Message}");
-            throw;
+            Console.WriteLine($"GetEffectiveAccessLevel error: {ex.Message}");
+            return null;
         }
     }
 
