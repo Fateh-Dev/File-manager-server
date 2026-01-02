@@ -4,6 +4,7 @@ using FileManager.API.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System;
 
 namespace FileManager.API.Controllers;
 
@@ -24,18 +25,26 @@ public class AdminController : ControllerBase
     [HttpGet("users")]
     public async Task<IActionResult> GetUsers()
     {
-        var users = await _context.Users
-            .Select(u => new
-            {
-                u.Id,
-                u.Username,
-                u.Role,
-                u.IsActive,
-                u.StorageLimit,
-                u.UsedStorage
-            })
-            .ToListAsync();
-        return Ok(users);
+        try
+        {
+            var users = await _context.Users
+                .Select(u => new
+                {
+                    u.Id,
+                    u.Username,
+                    u.Role,
+                    u.IsActive,
+                    u.StorageLimit,
+                    u.UsedStorage
+                })
+                .ToListAsync();
+            return Ok(users);
+        }
+        catch (Exception ex)
+        {
+            // Log the exception (omitted for brevity)
+            return StatusCode(500, new { Message = "Error retrieving users", Details = ex.Message });
+        }
     }
 
     [HttpPut("users/{id}/activate")]
