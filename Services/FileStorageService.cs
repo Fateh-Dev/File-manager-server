@@ -22,7 +22,8 @@ public class FileStorageService : IFileStorageService
 
     public async Task<string> SaveFileAsync(Stream fileStream, string fileName)
     {
-        var uniqueFileName = $"{Guid.NewGuid()}_{fileName}";
+        var baseFileName = Path.GetFileName(fileName);
+        var uniqueFileName = $"{Guid.NewGuid()}_{baseFileName}";
         var fullPath = Path.Combine(_storagePath, uniqueFileName);
 
         using (var stream = new FileStream(fullPath, FileMode.Create))

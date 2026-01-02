@@ -166,51 +166,60 @@ public class FileSystemController : ControllerBase
     [HttpPost("upload")]
     public async Task<IActionResult> UploadFile([FromForm] UploadFileDto dto)
     {
-        var userId = GetUserId();
-
-        if (!await HasPermission(userId, dto.FolderId, null, AccessLevel.Edit))
-            return Forbid();
-
-        var file = dto.File;
-        if (file == null || file.Length == 0) return BadRequest("No file uploaded");
-
-        // Check storage quota
-        var user = await _context.Users.FindAsync(userId);
-        if (user == null) return Unauthorized();
-
-        if (user.UsedStorage + file.Length > user.StorageLimit)
+        try
         {
-            return BadRequest(new { Error = "Storage quota exceeded. Please delete some files or contact an administrator." });
+            var userId = GetUserId();
+
+            if (!await HasPermission(userId, dto.FolderId, null, AccessLevel.Edit))
+                return Forbid();
+
+            var file = dto.File;
+            if (file == null || file.Length == 0) return BadRequest("No file uploaded");
+
+            // Check storage quota
+            var user = await _context.Users.FindAsync(userId);
+            if (user == null) return Unauthorized();
+
+            if (user.UsedStorage + file.Length > user.StorageLimit)
+            {
+                return BadRequest(new { Error = "Storage quota exceeded. Please delete some files or contact an administrator." });
+            }
+
+            var path = await _fileStorage.SaveFileAsync(file.OpenReadStream(), file.FileName);
+
+            var baseFileName = Path.GetFileName(file.FileName);
+            var metadata = new FileMetadata
+            {
+                Name = baseFileName,
+                Extension = Path.GetExtension(baseFileName),
+                Size = file.Length,
+                PhysicalPath = path,
+                FolderId = dto.FolderId,
+                OwnerId = userId
+            };
+
+            _context.Files.Add(metadata);
+            
+            // Update user storage usage
+            user.UsedStorage += file.Length;
+            
+            await _context.SaveChangesAsync();
+
+            return Ok(new 
+            { 
+                id = metadata.Id, 
+                name = metadata.Name, 
+                extension = metadata.Extension, 
+                size = metadata.Size, 
+                uploadDate = metadata.UploadDate,
+                folderId = metadata.FolderId
+            });
         }
-
-        var path = await _fileStorage.SaveFileAsync(file.OpenReadStream(), file.FileName);
-
-        var metadata = new FileMetadata
+        catch (Exception ex)
         {
-            Name = file.FileName,
-            Extension = Path.GetExtension(file.FileName),
-            Size = file.Length,
-            PhysicalPath = path,
-            FolderId = dto.FolderId,
-            OwnerId = userId
-        };
-
-        _context.Files.Add(metadata);
-        
-        // Update user storage usage
-        user.UsedStorage += file.Length;
-        
-        await _context.SaveChangesAsync();
-
-        return Ok(new 
-        { 
-            id = metadata.Id, 
-            name = metadata.Name, 
-            extension = metadata.Extension, 
-            size = metadata.Size, 
-            uploadDate = metadata.UploadDate,
-            folderId = metadata.FolderId
-        });
+            Console.WriteLine($"UploadFile Error: {ex}");
+            return StatusCode(500, new { Error = ex.Message, StackTrace = ex.StackTrace });
+        }
     }
 
     [HttpGet("download/{fileId}")]
