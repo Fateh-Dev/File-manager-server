@@ -13,7 +13,22 @@ public class FileStorageService : IFileStorageService
 
     public FileStorageService(IConfiguration configuration)
     {
-        _storagePath = configuration["FileStorage:Path"] ?? "C:\\FileStorage";
+        var path = configuration["FileStorage:Path"];
+        if (string.IsNullOrEmpty(path))
+        {
+            // Default to a folder in the application directory
+            _storagePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Storage");
+        }
+        else if (!Path.IsPathRooted(path))
+        {
+            // If relative, make it relative to the application directory
+            _storagePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, path);
+        }
+        else
+        {
+            _storagePath = path;
+        }
+
         if (!Directory.Exists(_storagePath))
         {
             Directory.CreateDirectory(_storagePath);
