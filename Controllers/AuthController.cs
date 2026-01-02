@@ -99,6 +99,29 @@ public class AuthController : ControllerBase
             user.UsedStorage
         });
     }
+
+    [Authorize]
+    [HttpPost("change-password")]
+    public async Task<IActionResult> ChangePassword(ChangePasswordDto dto)
+    {
+        var username = User.Identity?.Name;
+        if (string.IsNullOrEmpty(username)) return Unauthorized();
+
+        var user = await _context.Users.FirstOrDefaultAsync(u => u.Username == username);
+        if (user == null) return NotFound();
+
+        // Verify current password
+        if (!_authService.VerifyPassword(dto.CurrentPassword, user.PasswordHash))
+        {
+            return BadRequest("Current password is incorrect");
+        }
+
+        // Update password
+        user.PasswordHash = _authService.HashPassword(dto.NewPassword);
+        await _context.SaveChangesAsync();
+
+        return Ok(new { Message = "Password changed successfully" });
+    }
 }
 
 public class RegisterDto
@@ -111,4 +134,10 @@ public class LoginDto
 {
     public string Username { get; set; } = string.Empty;
     public string Password { get; set; } = string.Empty;
+}
+
+public class ChangePasswordDto
+{
+    public string CurrentPassword { get; set; } = string.Empty;
+    public string NewPassword { get; set; } = string.Empty;
 }
