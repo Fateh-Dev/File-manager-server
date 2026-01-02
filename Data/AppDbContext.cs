@@ -11,4 +11,5 @@ public class AppDbContext : DbContext
     public DbSet<Folder> Folders { get; set; } = null!;
     public DbSet<FileMetadata> Files { get; set; } = null!;
     public DbSet<Permission> Permissions { get; set; } = null!;
+    public DbSet<PdfTemplate> PdfTemplates { get; set; } = null!;
 }
