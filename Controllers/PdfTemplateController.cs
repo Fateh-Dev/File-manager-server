@@ -6,6 +6,13 @@ using Microsoft.EntityFrameworkCore;
 
 namespace FileManager.API.Controllers;
 
+public class SaveTemplateDto
+{
+    public string Name { get; set; } = string.Empty;
+    public IFormFile Image { get; set; } = null!;
+    public string FieldsJson { get; set; } = string.Empty;
+}
+
 [Authorize]
 [ApiController]
 [Route("api/[controller]")]
@@ -19,21 +26,21 @@ public class PdfTemplateController : ControllerBase
     }
 
     [HttpPost]
-    public async Task<IActionResult> SaveTemplate([FromForm] string name, [FromForm] IFormFile image, [FromForm] string fieldsJson)
+    public async Task<IActionResult> SaveTemplate([FromForm] SaveTemplateDto dto)
     {
-        if (string.IsNullOrEmpty(name) || image == null || string.IsNullOrEmpty(fieldsJson))
+        if (string.IsNullOrEmpty(dto.Name) || dto.Image == null || string.IsNullOrEmpty(dto.FieldsJson))
         {
             return BadRequest("Name, image and fields are required.");
         }
 
         using var memoryStream = new MemoryStream();
-        await image.CopyToAsync(memoryStream);
+        await dto.Image.CopyToAsync(memoryStream);
 
         var template = new PdfTemplate
         {
-            Name = name,
+            Name = dto.Name,
             ImageData = memoryStream.ToArray(),
-            FieldsJson = fieldsJson,
+            FieldsJson = dto.FieldsJson,
             CreatedAt = DateTime.UtcNow
         };
 
